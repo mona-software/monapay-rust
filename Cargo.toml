@@ -1,0 +1,15 @@
+[package]
+name = "monapay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["The MONA Group <info@themona.global>"]
+description = "Zero-crate-dependency Rust SDK for MONA Pay"
+license = "MIT"
+homepage = "https://monapay.vn/docs"
+repository = "https://github.com/themonagroup/monapay-rust"
+documentation = "https://monapay.vn/docs"
+keywords = ["payments", "vietqr", "webhook", "banking"]
+categories = ["api-bindings", "web-programming::http-client"]
+
+[dependencies]
