@@ -113,6 +113,34 @@ fn cache_headers_and_refresh_once() {
     );
 }
 
+#[test]
+fn create_checkout_sends_idempotency_and_client_secret() {
+    let transport = Arc::new(FakeTransport::default());
+    let client = Client::new(
+        Config::client_credentials("client-id", "secret")
+            .base_url("https://example.test")
+            .transport(transport.clone()),
+    )
+    .unwrap();
+    client
+        .checkouts()
+        .create(
+            Value::object([("amount", Value::from(250_000))]),
+            Some("checkout-key"),
+        )
+        .unwrap();
+    let state = transport.state.lock().unwrap();
+    let request = state.calls.last().unwrap();
+    assert_eq!(
+        request.headers.get("Idempotency-Key").map(String::as_str),
+        Some("checkout-key")
+    );
+    assert_eq!(
+        request.headers.get("X-Client-Secret").map(String::as_str),
+        Some("secret")
+    );
+}
+
 struct PagingTransport {
     pages: Mutex<Vec<String>>,
 }

@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 pub const DEFAULT_BASE_URL: &str = "https://api.monapay.vn";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -462,6 +463,12 @@ impl Client {
     pub fn bank_accounts(&self) -> BankAccounts<'_> {
         BankAccounts { client: self }
     }
+    pub fn payment_profile(&self) -> PaymentProfile<'_> {
+        PaymentProfile { client: self }
+    }
+    pub fn checkouts(&self) -> Checkouts<'_> {
+        Checkouts { client: self }
+    }
     pub fn qr(&self) -> QrPayments<'_> {
         QrPayments { client: self }
     }
@@ -511,8 +518,27 @@ impl Client {
         body: Option<Value>,
         query: &[(&str, String)],
     ) -> Result<Value, Error> {
+        self.request_with_headers(method, path, body, query, &[])
+    }
+
+    fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        query: &[(&str, String)],
+        custom_headers: &[(&str, String)],
+    ) -> Result<Value, Error> {
         let token = self.login()?;
-        match self.send(method, path, body.clone(), query, Some(&token), true) {
+        match self.send_with_headers(
+            method,
+            path,
+            body.clone(),
+            query,
+            Some(&token),
+            true,
+            custom_headers,
+        ) {
             Err(error) if error.status == Some(401) => {
                 let mut cached = self.inner.access_token.lock().map_err(lock_error)?;
                 if cached.as_ref().map(|item| item.value.as_str()) == Some(token.as_str()) {
@@ -520,7 +546,15 @@ impl Client {
                 }
                 drop(cached);
                 let refreshed = self.login()?;
-                self.send(method, path, body, query, Some(&refreshed), true)
+                self.send_with_headers(
+                    method,
+                    path,
+                    body,
+                    query,
+                    Some(&refreshed),
+                    true,
+                    custom_headers,
+                )
             }
             result => result,
         }
@@ -535,6 +569,20 @@ impl Client {
         query: &[(&str, String)],
         token: Option<&str>,
         authenticated: bool,
+    ) -> Result<Value, Error> {
+        self.send_with_headers(method, path, body, query, token, authenticated, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        query: &[(&str, String)],
+        token: Option<&str>,
+        authenticated: bool,
+        custom_headers: &[(&str, String)],
     ) -> Result<Value, Error> {
         let mut url = format!("{}{}", self.inner.base_url, path);
         let query_string = query
@@ -562,6 +610,9 @@ impl Client {
                     headers.insert("X-Client-Secret".to_owned(), secret);
                 }
             }
+        }
+        for (name, value) in custom_headers {
+            headers.insert((*name).to_owned(), value.clone());
         }
         let response = self.inner.transport.send(HttpRequest {
             method: method.to_owned(),
@@ -640,6 +691,32 @@ impl Keys<'_> {
             None,
             &[],
         )
+    }
+
+    pub fn reveal(&self, key_id: &str, confirmation: Value) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            &format!("/api/v1/client-keys/{}/reveal", percent_encode(key_id)),
+            Some(confirmation),
+            &[],
+        )
+    }
+
+    pub fn rotate(&self, key_id: &str) -> Result<Value, Error> {
+        let data = self.client.request(
+            "POST",
+            &format!("/api/v1/client-keys/{}/rotate", percent_encode(key_id)),
+            Some(empty_object()),
+            &[],
+        )?;
+        if let Some(secret) = data
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.client.set_client_secret(secret)?;
+        }
+        Ok(data)
     }
 }
 
@@ -720,6 +797,114 @@ impl BankAccounts<'_> {
     pub fn list(&self) -> Result<Value, Error> {
         self.client
             .request("GET", "/api/v1/client/bank-accounts", None, &[])
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PaymentProfile<'a> {
+    client: &'a Client,
+}
+
+impl PaymentProfile<'_> {
+    pub fn get(&self) -> Result<Value, Error> {
+        self.client
+            .request("GET", "/api/v1/payment-profile", None, &[])
+    }
+    pub fn set(&self, body: Value) -> Result<Value, Error> {
+        self.client
+            .request("PUT", "/api/v1/payment-profile", Some(body), &[])
+    }
+    pub fn rotate_return_secret(&self) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            "/api/v1/payment-profile/rotate-return-secret",
+            Some(empty_object()),
+            &[],
+        )
+    }
+    pub fn reveal_return_secret(&self, confirmation: Value) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            "/api/v1/payment-profile/reveal-return-secret",
+            Some(confirmation),
+            &[],
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CheckoutOptions {
+    pub status: Option<String>,
+    pub order_code: Option<String>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Checkouts<'a> {
+    client: &'a Client,
+}
+
+impl Checkouts<'_> {
+    pub fn create(&self, body: Value, idempotency_key: Option<&str>) -> Result<Value, Error> {
+        let key = idempotency_key
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(new_idempotency_key);
+        self.client.request_with_headers(
+            "POST",
+            "/api/v1/checkouts",
+            Some(body),
+            &[],
+            &[("Idempotency-Key", key)],
+        )
+    }
+
+    pub fn get(&self, checkout_id: &str) -> Result<Value, Error> {
+        self.client.request(
+            "GET",
+            &format!("/api/v1/checkouts/{}", percent_encode(checkout_id)),
+            None,
+            &[],
+        )
+    }
+
+    pub fn list(&self, options: &CheckoutOptions) -> Result<Value, Error> {
+        let mut query = Vec::new();
+        for (name, value) in [
+            ("status", options.status.as_ref()),
+            ("order_code", options.order_code.as_ref()),
+            ("from_date", options.from_date.as_ref()),
+            ("to_date", options.to_date.as_ref()),
+        ] {
+            if let Some(value) = value {
+                query.push((name.to_owned(), value.clone()));
+            }
+        }
+        if let Some(value) = options.page {
+            query.push(("page".to_owned(), value.to_string()));
+        }
+        if let Some(value) = options.limit {
+            query.push(("limit".to_owned(), value.to_string()));
+        }
+        self.client
+            .request("GET", "/api/v1/checkouts", None, &query_refs(&query))
+    }
+
+    pub fn cancel(&self, checkout_id: &str, idempotency_key: Option<&str>) -> Result<Value, Error> {
+        let key = idempotency_key
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(new_idempotency_key);
+        self.client.request_with_headers(
+            "POST",
+            &format!("/api/v1/checkouts/{}/cancel", percent_encode(checkout_id)),
+            Some(empty_object()),
+            &[],
+            &[("Idempotency-Key", key)],
+        )
     }
 }
 
@@ -1186,6 +1371,39 @@ fn percent_encode(value: &str) -> String {
         }
     }
     output
+}
+
+fn empty_object() -> Value {
+    Value::Object(BTreeMap::new())
+}
+
+fn new_idempotency_key() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seed = format!(
+        "{}:{}:{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let digest = sha256(seed.as_bytes());
+    let mut bytes = digest[..16].to_vec();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]

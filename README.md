@@ -32,7 +32,19 @@ for transaction in client.transactions().iterate("MONA123", TransactionOptions::
 }
 ```
 
-Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + iterator/retry, webhook, sandbox, email configs/logs/suppressions.
+Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, payment profile, hosted checkout, bank accounts, VA + hai OTP, QR, transactions + iterator/retry, webhook, sandbox, email configs/logs/suppressions.
+
+## Trang thanh toán (hosted checkout)
+
+```rust
+let checkout = client.checkouts().create(Value::object([("amount", 250000.into()), ("order_code", "DH10234".into()), ("return_url", "https://shop.vn/payment/return".into())]), None)?;
+redirect(checkout.get("checkout_url").unwrap().as_str().unwrap());
+if event.get("type").and_then(Value::as_str) == Some("CHECKOUT_PAID") {
+    fulfill_once(event.get("data").unwrap().get("order_code").unwrap());
+}
+```
+
+SDK tự sinh `Idempotency-Key` cho `create` và `cancel`; truyền `Some(key)` khi anh chị cần dùng key riêng. Nguồn sự thật để giao hàng là webhook `CHECKOUT_PAID` hoặc kết quả `get`, không phải redirect trình duyệt.
 
 Rust `std` không có TLS client. `CurlTransport` mặc định gọi executable `curl` hệ thống; toàn bộ config chứa credential/body được truyền qua stdin, không nằm trong argv và không qua shell. Ứng dụng không có `curl` có thể implement trait `Transport` bằng HTTP stack sẵn có rồi truyền `Config::transport(Arc::new(...))`; crate không ép thêm `reqwest` hay crate TLS.
 
