@@ -1,6 +1,6 @@
 [package]
 name = "monapay"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["The MONA Group <info@themona.global>"]

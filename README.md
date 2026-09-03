@@ -1,6 +1,24 @@
 # MONA Pay Rust SDK
 
-Crate Rust không có crate dependency, gồm client đầy đủ, JSON codec và SHA-256/HMAC tự cài bằng `std`. MONA Pay là cổng thanh toán và API ngân hàng của The MONA Group, giúp doanh nghiệp Việt Nam nhận và xác nhận tiền chuyển khoản theo thời gian thực qua tài khoản ảo (VA), VietQR, webhook và Telegram — thiết kế để cả lập trình viên lẫn AI agent tích hợp trong vài phút.
+Crate Rust không có crate dependency, gồm client đầy đủ, JSON codec và SHA-256/HMAC tự cài bằng `std`. MONA Pay là cổng thanh toán và API ngân hàng của The MONA Group, giúp doanh nghiệp Việt Nam nhận và xác nhận tiền chuyển khoản theo thời gian thực qua tài khoản ảo (VA), VietQR, webhook và Telegram, thiết kế để cả lập trình viên lẫn AI agent tích hợp trong vài phút.
+
+## Xác thực cho AI agent
+
+```bash
+export MONAPAY_CLIENT_ID="client-id"
+export MONAPAY_CLIENT_SECRET="client-secret"
+export MONAPAY_BASE_URL="https://api.monapay.vn"
+```
+
+```rust
+let client = Client::from_env()?;
+let profile = client.me()?;
+let qr = client.qr().generate(qr_body)?;
+let sandbox = client.sandbox().create_transaction(Value::object([("virtual_account_number", "MONA123".into()), ("amount", 10000.into()), ("description", "AI test".into())]))?;
+println!("{}", profile.to_json());
+```
+
+`Client::from_env()` ưu tiên client credentials, cache token tới gần hạn và tự lấy lại khi gặp HTTP 401. Username/password chỉ là fallback tương thích cũ, không dùng cho AI agent vì sẽ gãy khi bật 2FA.
 
 ```rust
 use monapay::{Client, Config, TransactionOptions};
@@ -14,9 +32,9 @@ for transaction in client.transactions().iterate("MONA123", TransactionOptions::
 }
 ```
 
-Client tự login/cache token, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + iterator, retry, webhook configs/test và logs/stats.
+Client cache token theo hạn, refresh đúng một lần sau HTTP 401 và chỉ gắn `X-Client-Secret` vào POST/PUT/DELETE. Surface gồm keys, bank accounts, VA + hai OTP, QR, transactions + iterator/retry, webhook, sandbox, email configs/logs/suppressions.
 
-Rust `std` không có TLS client. `CurlTransport` mặc định gọi executable `curl` hệ thống; toàn bộ config chứa credential/body được truyền qua stdin, không nằm trong argv và không qua shell. Ứng dụng không có `curl` có thể implement trait `Transport` bằng HTTP stack sẵn có rồi truyền `Config::transport(Arc::new(...))`—crate không ép thêm `reqwest` hay crate TLS.
+Rust `std` không có TLS client. `CurlTransport` mặc định gọi executable `curl` hệ thống; toàn bộ config chứa credential/body được truyền qua stdin, không nằm trong argv và không qua shell. Ứng dụng không có `curl` có thể implement trait `Transport` bằng HTTP stack sẵn có rồi truyền `Config::transport(Arc::new(...))`; crate không ép thêm `reqwest` hay crate TLS.
 
 ```rust
 let result = monapay::verify_webhook(raw_bytes, timestamp, signature, webhook_secret, 300)?;

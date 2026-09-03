@@ -5,9 +5,9 @@ use std::fmt;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.3.0";
 pub const DEFAULT_BASE_URL: &str = "https://api.monapay.vn";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -274,6 +274,7 @@ fn curl_escape(value: &str) -> String {
 }
 
 pub struct Config {
+    client_id: String,
     username: String,
     password: String,
     client_secret: String,
@@ -284,9 +285,24 @@ pub struct Config {
 impl Config {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
+            client_id: String::new(),
             username: username.into(),
             password: password.into(),
             client_secret: String::new(),
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            transport: Arc::new(CurlTransport),
+        }
+    }
+
+    pub fn client_credentials(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            username: String::new(),
+            password: String::new(),
+            client_secret: client_secret.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             transport: Arc::new(CurlTransport),
         }
@@ -309,12 +325,19 @@ impl Config {
 }
 
 struct Inner {
+    client_id: String,
     username: String,
     password: String,
     base_url: String,
-    access_token: Mutex<Option<String>>,
+    access_token: Mutex<Option<CachedToken>>,
     client_secret: Mutex<String>,
     transport: Arc<dyn Transport>,
+}
+
+#[derive(Clone)]
+struct CachedToken {
+    value: String,
+    expires_at: SystemTime,
 }
 
 #[derive(Clone)]
@@ -324,11 +347,12 @@ pub struct Client {
 
 impl Client {
     pub fn new(config: Config) -> Result<Self, Error> {
-        if config.username.trim().is_empty() {
-            return Err(Error::new("username là bắt buộc"));
-        }
-        if config.password.is_empty() {
-            return Err(Error::new("password là bắt buộc"));
+        let has_client_credentials =
+            !config.client_id.trim().is_empty() && !config.client_secret.trim().is_empty();
+        let has_password_credentials =
+            !config.username.trim().is_empty() && !config.password.is_empty();
+        if !has_client_credentials && !has_password_credentials {
+            return Err(Error::new("cần client ID + client secret hoặc username + password; không dùng password cho AI agent vì sẽ gãy khi bật 2FA"));
         }
         let base_url = config.base_url.trim_end_matches('/').to_owned();
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
@@ -336,6 +360,7 @@ impl Client {
         }
         Ok(Self {
             inner: Arc::new(Inner {
+                client_id: config.client_id,
                 username: config.username,
                 password: config.password,
                 base_url,
@@ -346,17 +371,50 @@ impl Client {
         })
     }
 
+    pub fn from_env() -> Result<Self, Error> {
+        let client_id = std::env::var("MONAPAY_CLIENT_ID").unwrap_or_default();
+        let client_secret = std::env::var("MONAPAY_CLIENT_SECRET").unwrap_or_default();
+        let mut config = if !client_id.is_empty() && !client_secret.is_empty() {
+            Config::client_credentials(client_id, client_secret)
+        } else {
+            Config::new(
+                std::env::var("MONAPAY_USERNAME").unwrap_or_default(),
+                std::env::var("MONAPAY_PASSWORD").unwrap_or_default(),
+            )
+            .client_secret(client_secret)
+        };
+        if let Ok(base_url) = std::env::var("MONAPAY_BASE_URL") {
+            config = config.base_url(base_url);
+        }
+        Self::new(config)
+    }
+
     pub fn login(&self) -> Result<String, Error> {
         if let Some(token) = self.token()? {
             return Ok(token);
         }
+        let client_secret = self.inner.client_secret.lock().map_err(lock_error)?.clone();
+        let using_client_credentials =
+            !self.inner.client_id.is_empty() && !client_secret.is_empty();
         let data = self.send(
             "POST",
-            "/api/v1/client/login",
-            Some(Value::object([
-                ("username", Value::from(self.inner.username.clone())),
-                ("password", Value::from(self.inner.password.clone())),
-            ])),
+            if using_client_credentials {
+                "/api/v1/oauth/token"
+            } else {
+                "/api/v1/client/login"
+            },
+            Some(if using_client_credentials {
+                Value::object([
+                    ("grant_type", Value::from("client_credentials")),
+                    ("client_id", Value::from(self.inner.client_id.clone())),
+                    ("client_secret", Value::from(client_secret)),
+                ])
+            } else {
+                Value::object([
+                    ("username", Value::from(self.inner.username.clone())),
+                    ("password", Value::from(self.inner.password.clone())),
+                ])
+            }),
             &[],
             None,
             false,
@@ -368,10 +426,27 @@ impl Client {
             .ok_or_else(|| Error::new("Response đăng nhập không có access_token"))?
             .to_owned();
         let mut cached = self.inner.access_token.lock().map_err(lock_error)?;
+        let default_expires = if using_client_credentials {
+            3600
+        } else {
+            86_400
+        };
+        let expires_in = data
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(default_expires)
+            .max(0) as u64;
+        let cached_token = CachedToken {
+            value: token.clone(),
+            expires_at: SystemTime::now() + Duration::from_secs(expires_in.saturating_sub(60)),
+        };
         if cached.is_none() {
-            *cached = Some(token.clone());
+            *cached = Some(cached_token);
         }
-        Ok(cached.clone().unwrap_or(token))
+        Ok(cached
+            .as_ref()
+            .map(|item| item.value.clone())
+            .unwrap_or(token))
     }
 
     pub fn me(&self) -> Result<Value, Error> {
@@ -399,6 +474,18 @@ impl Client {
     pub fn webhook_logs(&self) -> WebhookLogs<'_> {
         WebhookLogs { client: self }
     }
+    pub fn sandbox(&self) -> Sandbox<'_> {
+        Sandbox { client: self }
+    }
+    pub fn email_configs(&self) -> EmailConfigs<'_> {
+        EmailConfigs { client: self }
+    }
+    pub fn email_logs(&self) -> EmailLogs<'_> {
+        EmailLogs { client: self }
+    }
+    pub fn email_suppressions(&self) -> EmailSuppressions<'_> {
+        EmailSuppressions { client: self }
+    }
 
     pub fn set_client_secret(&self, value: impl Into<String>) -> Result<(), Error> {
         *self.inner.client_secret.lock().map_err(lock_error)? = value.into();
@@ -406,7 +493,15 @@ impl Client {
     }
 
     fn token(&self) -> Result<Option<String>, Error> {
-        Ok(self.inner.access_token.lock().map_err(lock_error)?.clone())
+        let mut cached = self.inner.access_token.lock().map_err(lock_error)?;
+        if cached
+            .as_ref()
+            .map(|item| item.expires_at <= SystemTime::now())
+            .unwrap_or(false)
+        {
+            *cached = None;
+        }
+        Ok(cached.as_ref().map(|item| item.value.clone()))
     }
 
     fn request(
@@ -420,7 +515,7 @@ impl Client {
         match self.send(method, path, body.clone(), query, Some(&token), true) {
             Err(error) if error.status == Some(401) => {
                 let mut cached = self.inner.access_token.lock().map_err(lock_error)?;
-                if cached.as_deref() == Some(token.as_str()) {
+                if cached.as_ref().map(|item| item.value.as_str()) == Some(token.as_str()) {
                     *cached = None;
                 }
                 drop(cached);
@@ -916,6 +1011,169 @@ fn query_refs(query: &[(String, String)]) -> Vec<(&str, String)> {
         .iter()
         .map(|(key, value)| (key.as_str(), value.clone()))
         .collect()
+}
+
+#[derive(Clone, Copy)]
+pub struct Sandbox<'a> {
+    client: &'a Client,
+}
+
+impl Sandbox<'_> {
+    pub fn create_transaction(&self, body: Value) -> Result<Value, Error> {
+        self.client
+            .request("POST", "/api/v1/sandbox/transactions", Some(body), &[])
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct EmailConfigs<'a> {
+    client: &'a Client,
+}
+
+impl EmailConfigs<'_> {
+    pub fn list(&self) -> Result<Value, Error> {
+        self.client
+            .request("GET", "/api/v1/email-configs", None, &[])
+    }
+    pub fn create(&self, body: Value) -> Result<Value, Error> {
+        self.client
+            .request("POST", "/api/v1/email-configs", Some(body), &[])
+    }
+    pub fn get(&self, config_id: &str) -> Result<Value, Error> {
+        self.client.request(
+            "GET",
+            &format!("/api/v1/email-configs/{}", percent_encode(config_id)),
+            None,
+            &[],
+        )
+    }
+    pub fn update(&self, config_id: &str, body: Value) -> Result<Value, Error> {
+        self.client.request(
+            "PUT",
+            &format!("/api/v1/email-configs/{}", percent_encode(config_id)),
+            Some(body),
+            &[],
+        )
+    }
+    pub fn remove(&self, config_id: &str) -> Result<Value, Error> {
+        self.client.request(
+            "DELETE",
+            &format!("/api/v1/email-configs/{}", percent_encode(config_id)),
+            None,
+            &[],
+        )
+    }
+    pub fn verify(&self, config_id: &str, email: &str, code: &str) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            &format!("/api/v1/email-configs/{}/verify", percent_encode(config_id)),
+            Some(Value::object([
+                ("email", Value::from(email)),
+                ("code", Value::from(code)),
+            ])),
+            &[],
+        )
+    }
+    pub fn resend_verification(&self, config_id: &str, email: &str) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            &format!(
+                "/api/v1/email-configs/{}/resend-verification",
+                percent_encode(config_id)
+            ),
+            Some(Value::object([("email", Value::from(email))])),
+            &[],
+        )
+    }
+    pub fn test(&self, config_id: &str) -> Result<Value, Error> {
+        self.client.request(
+            "POST",
+            &format!("/api/v1/email-configs/{}/test", percent_encode(config_id)),
+            Some(Value::object(Vec::<(String, Value)>::new())),
+            &[],
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EmailLogOptions {
+    pub config_id: Option<String>,
+    pub status: Option<String>,
+    pub event_type: Option<String>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub struct EmailLogs<'a> {
+    client: &'a Client,
+}
+
+impl EmailLogs<'_> {
+    pub fn list(&self, options: &EmailLogOptions) -> Result<Value, Error> {
+        let query = email_log_query(options, true);
+        self.client
+            .request("GET", "/api/v1/email-logs", None, &query_refs(&query))
+    }
+    pub fn stats(&self, options: &EmailLogOptions) -> Result<Value, Error> {
+        let query = email_log_query(options, false);
+        self.client
+            .request("GET", "/api/v1/email-logs/stats", None, &query_refs(&query))
+    }
+}
+
+fn email_log_query(options: &EmailLogOptions, include_filters: bool) -> Vec<(String, String)> {
+    let mut query = Vec::new();
+    if include_filters {
+        for (key, value) in [
+            ("config_id", &options.config_id),
+            ("status", &options.status),
+            ("event_type", &options.event_type),
+        ] {
+            if let Some(value) = value {
+                query.push((key.to_owned(), value.clone()));
+            }
+        }
+    }
+    for (key, value) in [
+        ("from_date", &options.from_date),
+        ("to_date", &options.to_date),
+    ] {
+        if let Some(value) = value {
+            query.push((key.to_owned(), value.clone()));
+        }
+    }
+    if include_filters {
+        if let Some(value) = options.page {
+            query.push(("page".to_owned(), value.to_string()));
+        }
+        if let Some(value) = options.limit {
+            query.push(("limit".to_owned(), value.to_string()));
+        }
+    }
+    query
+}
+
+#[derive(Clone, Copy)]
+pub struct EmailSuppressions<'a> {
+    client: &'a Client,
+}
+
+impl EmailSuppressions<'_> {
+    pub fn list(&self) -> Result<Value, Error> {
+        self.client
+            .request("GET", "/api/v1/email-suppressions", None, &[])
+    }
+    pub fn remove(&self, email: &str) -> Result<Value, Error> {
+        self.client.request(
+            "DELETE",
+            &format!("/api/v1/email-suppressions/{}", percent_encode(email)),
+            None,
+            &[],
+        )
+    }
 }
 
 fn percent_encode(value: &str) -> String {

@@ -23,12 +23,26 @@ impl Transport for FakeTransport {
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, monapay::Error> {
         let mut state = self.state.lock().unwrap();
         state.calls.push(request.clone());
-        if request.url.ends_with("/api/v1/client/login") {
+        if request.url.ends_with("/api/v1/oauth/token") {
             state.logins += 1;
-            return Ok(envelope(Value::object([(
-                "access_token",
-                Value::from(format!("token-{}", state.logins)),
-            )])));
+            assert_eq!(
+                request
+                    .body
+                    .as_deref()
+                    .and_then(|body| Value::parse_json(body).ok()),
+                Some(Value::object([
+                    ("grant_type", Value::from("client_credentials")),
+                    ("client_id", Value::from("client-id")),
+                    ("client_secret", Value::from("secret")),
+                ]))
+            );
+            return Ok(envelope(Value::object([
+                (
+                    "access_token",
+                    Value::from(format!("token-{}", state.logins)),
+                ),
+                ("expires_in", Value::from(3600)),
+            ])));
         }
         if request.url.ends_with("/api/v1/client/me") {
             state.me_calls += 1;
@@ -54,8 +68,7 @@ fn envelope(data: Value) -> HttpResponse {
 fn cache_headers_and_refresh_once() {
     let transport = Arc::new(FakeTransport::default());
     let client = Client::new(
-        Config::new("user", "pass")
-            .client_secret("secret")
+        Config::client_credentials("client-id", "secret")
             .base_url("https://example.test/")
             .transport(transport.clone()),
     )
